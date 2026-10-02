@@ -23,9 +23,22 @@ class Target:
 
     @classmethod
     def parse(cls, spec: str) -> "Target":
-        host, sep, port = spec.strip().rpartition(":")
-        if not sep:
-            host, port = spec.strip(), "443"
+        """Parse ``host``, ``host:port``, ``[ipv6]``, ``[ipv6]:port`` or bare ``ipv6``."""
+        text = spec.strip()
+        if text.startswith("["):
+            end = text.find("]")
+            if end == -1:
+                raise ValueError(f"invalid target {spec!r}: missing ']'")
+            host, rest = text[1:end], text[end + 1 :]
+            if rest and not rest.startswith(":"):
+                raise ValueError(f"invalid target {spec!r}: expected ':' after ']'")
+            port = rest[1:] if rest else "443"
+        elif text.count(":") > 1:
+            host, port = text, "443"  # bare IPv6 address, no port
+        elif ":" in text:
+            host, _, port = text.partition(":")
+        else:
+            host, port = text, "443"
         if not host:
             raise ValueError(f"invalid target {spec!r}: missing host")
         try:
@@ -37,7 +50,8 @@ class Target:
         return cls(host, port_num)
 
     def __str__(self) -> str:
-        return f"{self.host}:{self.port}"
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{host}:{self.port}"
 
 
 DEFAULT_TARGETS = (

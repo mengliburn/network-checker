@@ -105,6 +105,25 @@ class TargetParseTests(unittest.TestCase):
     def test_parse_defaults_to_443(self):
         self.assertEqual(Target.parse("example.com"), Target("example.com", 443))
 
+    def test_parse_bracketed_ipv6_with_port(self):
+        self.assertEqual(Target.parse("[2001:db8::1]:53"), Target("2001:db8::1", 53))
+
+    def test_parse_bracketed_ipv6_without_port(self):
+        self.assertEqual(Target.parse("[::1]"), Target("::1", 443))
+
+    def test_parse_bare_ipv6_defaults_to_443(self):
+        self.assertEqual(Target.parse("2001:db8::1"), Target("2001:db8::1", 443))
+        self.assertEqual(Target.parse("::1"), Target("::1", 443))
+
+    def test_ipv6_str_uses_brackets(self):
+        self.assertEqual(str(Target("::1", 443)), "[::1]:443")
+
+    def test_parse_rejects_malformed_brackets(self):
+        with self.assertRaises(ValueError):
+            Target.parse("[::1")
+        with self.assertRaises(ValueError):
+            Target.parse("[::1]x443")
+
     def test_parse_rejects_bad_port(self):
         with self.assertRaises(ValueError):
             Target.parse("example.com:notaport")
