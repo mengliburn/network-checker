@@ -4,11 +4,11 @@ from pathlib import Path
 
 from network_checker.agent import (
     DEFAULT_AGENT_COMMAND,
-    MAX_LOG_CHARS_IN_PROMPT,
+    MAX_LOG_BYTES_IN_PROMPT,
     build_prompt,
     invoke_agent,
 )
-from network_checker.diagnostics import CommandResult
+from network_checker.diagnostics import CommandResult, run_command
 
 
 class FakeRunner:
@@ -98,6 +98,14 @@ class InvokeAgentTests(unittest.TestCase):
         self.assertTrue(outcome.invoked)
         self.assertIn(str(missing), runner.calls[0][0][1])
 
+    def test_huge_non_ascii_log_can_still_be_passed_to_a_real_process(self):
+        self.log.write_text("\u00e9\ufffd" * 200_000, encoding="utf-8")
+        outcome = invoke_agent(
+            self.log, ["python3", "-c", "import sys; print(len(sys.argv[1]))", "{prompt}"], runner=run_command
+        )
+        self.assertTrue(outcome.invoked, outcome.message)
+        self.assertTrue(outcome.success, outcome.message)
+
     def test_default_command_passes_prompt(self):
         self.assertIn("{prompt}", DEFAULT_AGENT_COMMAND)
 
@@ -109,12 +117,21 @@ class BuildPromptTests(unittest.TestCase):
         self.assertIn("LOG BODY", prompt)
 
     def test_long_logs_are_truncated_keeping_head_and_tail(self):
-        body = "HEAD" + "A" * (MAX_LOG_CHARS_IN_PROMPT * 2) + "TAIL"
+        body = "HEAD" + "A" * (MAX_LOG_BYTES_IN_PROMPT * 2) + "TAIL"
         prompt = build_prompt(Path("/x/diag.log"), body)
-        self.assertLess(len(prompt), MAX_LOG_CHARS_IN_PROMPT + 2000)
+        self.assertLess(len(prompt), MAX_LOG_BYTES_IN_PROMPT + 2000)
         self.assertIn("truncated", prompt)
         self.assertIn("HEAD", prompt)
         self.assertIn("TAIL", prompt)
+
+    def test_truncation_is_by_encoded_bytes_for_non_ascii_logs(self):
+        body = "\ufffd" * (MAX_LOG_BYTES_IN_PROMPT * 2)
+        prompt = build_prompt(Path("/x/diag.log"), body)
+        self.assertLess(len(prompt.encode("utf-8")), MAX_LOG_BYTES_IN_PROMPT + 2000)
+
+    def test_prompt_fits_windows_command_line_limit(self):
+        prompt = build_prompt(Path("/x/diag.log"), "x" * 1_000_000)
+        self.assertLess(len(prompt), 30_000)
 
 
 if __name__ == "__main__":

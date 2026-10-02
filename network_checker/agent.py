@@ -16,7 +16,10 @@ from .diagnostics import Runner, run_command
 
 # GitHub Copilot CLI in non-interactive mode. Override with --agent-cmd.
 DEFAULT_AGENT_COMMAND = ("copilot", "-p", "{prompt}")
-MAX_LOG_CHARS_IN_PROMPT = 60_000
+# The prompt is passed as a single argv element. Linux caps one argument at
+# 128 KiB (bytes) and Windows caps the whole command line at ~32k chars, so
+# embed a bounded excerpt (UTF-8 bytes >= chars) and point at the full file.
+MAX_LOG_BYTES_IN_PROMPT = 24_000
 
 PROMPT_TEMPLATE = """\
 An automated internet/network health check on this machine just failed.
@@ -40,14 +43,20 @@ class AgentOutcome:
     output_path: Optional[Path] = None
 
 
+def _truncate_bytes(text: str, limit: int) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    half = limit // 2
+    # errors="ignore" drops any multi-byte character split at the cut points.
+    head = data[:half].decode("utf-8", errors="ignore")
+    tail = data[-half:].decode("utf-8", errors="ignore")
+    omitted = len(data) - 2 * half
+    return f"{head}\n\n[... {omitted} bytes truncated; see the full log file ...]\n\n{tail}"
+
+
 def build_prompt(log_path: Path, log_text: str) -> str:
-    if len(log_text) > MAX_LOG_CHARS_IN_PROMPT:
-        half = MAX_LOG_CHARS_IN_PROMPT // 2
-        log_text = (
-            log_text[:half]
-            + f"\n\n[... {len(log_text) - 2 * half} characters truncated; see the log file ...]\n\n"
-            + log_text[-half:]
-        )
+    log_text = _truncate_bytes(log_text, MAX_LOG_BYTES_IN_PROMPT)
     # str.replace (not str.format) so braces in log content are harmless.
     return PROMPT_TEMPLATE.replace("{log_file}", str(log_path)).replace("{log_text}", log_text)
 
