@@ -6,6 +6,7 @@ import math
 import os
 import signal
 import sys
+import threading
 from typing import List, Optional
 
 from .agent import DEFAULT_AGENT_TIMEOUT, invoke_agent, parse_agent_command
@@ -37,6 +38,8 @@ def install_signal_handlers() -> dict:
     previous = {}
     for sig in TERMINATION_SIGNALS:
         try:
+            if signal.getsignal(sig) == signal.SIG_IGN:
+                continue  # respect e.g. nohup ignoring SIGHUP
             previous[sig] = signal.signal(sig, _raise_interrupt)
         except (ValueError, OSError):  # not main thread / unsupported
             pass
@@ -77,12 +80,18 @@ def _duration(minimum_exclusive: bool):
             value = float(text)
         except ValueError:
             raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
-        if not math.isfinite(value) or value < 0 or (minimum_exclusive and value == 0):
+        if (not math.isfinite(value) or value < 0 or value > MAX_SECONDS
+                or (minimum_exclusive and value == 0)):
+            low = "> 0" if minimum_exclusive else ">= 0"
             raise argparse.ArgumentTypeError(
-                f"must be {'> 0' if minimum_exclusive else '>= 0'} seconds: {text!r}")
+                f"must be {low} and <= {MAX_SECONDS:g} seconds: {text!r}")
         return value
     return parse
 
+
+# sleep/settimeout/Thread.join overflow on huge values. TIMEOUT_MAX is only
+# ~49 days on Windows, so stay well below it (plus a year cap elsewhere).
+MAX_SECONDS = min(365 * 24 * 3600.0, threading.TIMEOUT_MAX / 2)
 
 positive_seconds = _duration(minimum_exclusive=True)
 non_negative_seconds = _duration(minimum_exclusive=False)

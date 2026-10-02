@@ -149,7 +149,7 @@ def test_main_restores_previous_signal_handlers(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("flag", ["--interval", "--timeout", "--agent-timeout"])
-@pytest.mark.parametrize("value", ["0", "-1", "nan"])
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "1e300"])
 def test_durations_must_be_positive(flag, value, tmp_path):
     with pytest.raises(SystemExit) as info:
         cli.main(["--once", "--log-dir", str(tmp_path), flag, value])
@@ -160,3 +160,20 @@ def test_cooldown_may_be_zero_but_not_negative(tmp_path):
     with pytest.raises(SystemExit) as info:
         cli.main(["--once", "--log-dir", str(tmp_path), "--cooldown", "-5"])
     assert info.value.code == 2
+
+
+def test_ignored_signals_stay_ignored_for_nohup():
+    import signal
+    sig = cli.TERMINATION_SIGNALS[0]
+    previous = signal.signal(sig, signal.SIG_IGN)
+    try:
+        saved = cli.install_signal_handlers()
+        assert signal.getsignal(sig) == signal.SIG_IGN
+        cli.restore_signal_handlers(saved)
+    finally:
+        signal.signal(sig, previous)
+
+
+def test_duration_cap_is_safe_for_thread_join_on_every_platform():
+    import threading
+    assert cli.MAX_SECONDS + 1 < threading.TIMEOUT_MAX
