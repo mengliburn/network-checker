@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import signal
 import sys
@@ -70,6 +71,23 @@ def parse_target(value: str) -> Target:
     return Target(host, port)
 
 
+def _duration(minimum_exclusive: bool):
+    def parse(text: str) -> float:
+        try:
+            value = float(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"not a number: {text!r}") from None
+        if not math.isfinite(value) or value < 0 or (minimum_exclusive and value == 0):
+            raise argparse.ArgumentTypeError(
+                f"must be {'> 0' if minimum_exclusive else '>= 0'} seconds: {text!r}")
+        return value
+    return parse
+
+
+positive_seconds = _duration(minimum_exclusive=True)
+non_negative_seconds = _duration(minimum_exclusive=False)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="network_checker",
@@ -77,9 +95,9 @@ def build_parser() -> argparse.ArgumentParser:
                     "and optionally invokes an agent when the network is down.")
     p.add_argument("--once", action="store_true",
                    help="run a single check; exit 0 if healthy, 1 if not")
-    p.add_argument("--interval", type=float, default=60.0, help="seconds between checks (default 60)")
-    p.add_argument("--timeout", type=float, default=5.0, help="per-check timeout in seconds (default 5)")
-    p.add_argument("--cooldown", type=float, default=900.0,
+    p.add_argument("--interval", type=positive_seconds, default=60.0, help="seconds between checks (default 60)")
+    p.add_argument("--timeout", type=positive_seconds, default=5.0, help="per-check timeout in seconds (default 5)")
+    p.add_argument("--cooldown", type=non_negative_seconds, default=900.0,
                    help="minimum seconds between diagnostics during one outage (default 900)")
     p.add_argument("--log-dir", default="logs", help="directory for logs (default ./logs)")
     p.add_argument("--target", action="append", type=parse_target, metavar="HOST[:PORT]",
@@ -91,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--agent-cmd", default=os.environ.get(AGENT_ENV),
                    help="agent command run on failure; {log}, {json}, {prompt} are substituted "
                         f"(default: ${AGENT_ENV}; omit to only collect diagnostics)")
-    p.add_argument("--agent-timeout", type=float, default=DEFAULT_AGENT_TIMEOUT,
+    p.add_argument("--agent-timeout", type=positive_seconds, default=DEFAULT_AGENT_TIMEOUT,
                    help="seconds before the agent is abandoned (default 600)")
     p.add_argument("--quiet", action="store_true", help="do not echo status lines to stdout")
     return p

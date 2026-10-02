@@ -146,3 +146,17 @@ def test_main_restores_previous_signal_handlers(monkeypatch, tmp_path):
         assert signal.getsignal(signal.SIGTERM) is sentinel
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+@pytest.mark.parametrize("flag", ["--interval", "--timeout", "--agent-timeout"])
+@pytest.mark.parametrize("value", ["0", "-1", "nan"])
+def test_durations_must_be_positive(flag, value, tmp_path):
+    with pytest.raises(SystemExit) as info:
+        cli.main(["--once", "--log-dir", str(tmp_path), flag, value])
+    assert info.value.code == 2
+
+
+def test_cooldown_may_be_zero_but_not_negative(tmp_path):
+    with pytest.raises(SystemExit) as info:
+        cli.main(["--once", "--log-dir", str(tmp_path), "--cooldown", "-5"])
+    assert info.value.code == 2

@@ -284,3 +284,23 @@ def test_truncation_cuts_on_utf8_character_boundaries(monkeypatch, limit):
     head, _, tail = body.partition("[")
     assert set(head) <= {"é", "€"} and head
     assert set(tail.split("]")[-1]) <= {"é", "€"}
+
+
+SAMPLE = "aé€😀" * 3  # 1-, 2-, 3- and 4-byte UTF-8 characters
+
+
+@pytest.mark.parametrize("cut", range(len(SAMPLE.encode("utf-8")) + 1))
+def test_trim_helpers_produce_valid_utf8_for_every_cut(cut):
+    data = SAMPLE.encode("utf-8")
+    head = diag_mod._trim_partial_utf8_end(data[:cut])
+    tail = diag_mod._trim_partial_utf8_start(data[cut:])
+    head.decode("utf-8")  # strict: must not raise
+    tail.decode("utf-8")
+    assert data.startswith(head) and data.endswith(tail)
+    assert cut - len(head) <= 3 and (len(data) - cut) - len(tail) <= 3  # at most one char lost
+
+
+def test_trim_helpers_leave_non_utf8_codepage_output_alone():
+    oem = "Zeitüberschreitung".encode("cp850")
+    assert diag_mod._trim_partial_utf8_start(oem) == oem
+    assert diag_mod._trim_partial_utf8_end(oem) == oem
