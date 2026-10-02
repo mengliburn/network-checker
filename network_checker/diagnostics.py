@@ -6,9 +6,9 @@ recorded in the log instead of aborting, so a later agent has maximum context.
 from __future__ import annotations
 
 import json
+import locale
 import os
 import platform
-import re
 import socket
 import subprocess
 import threading
@@ -21,6 +21,7 @@ from .health import HealthResult
 
 PING_IP = "1.1.1.1"
 DNS_NAME = "www.google.com"
+HTTP_PROBE_URL = "http://connectivitycheck.gstatic.com/generate_204"
 PROXY_VARS = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
               "http_proxy", "https_proxy", "all_proxy", "no_proxy")
 
@@ -49,7 +50,7 @@ def commands_for_platform(system: str) -> List[Command]:
             ("ping_name", ["ping", "-n", "3", "-w", "2000", DNS_NAME]),
             ("dns_lookup", ["nslookup", DNS_NAME]),
             ("traceroute", ["tracert", "-d", "-h", "15", "-w", "1000", PING_IP]),
-            ("http_probe", ["curl.exe", "-sS", "-I", "-m", "10", "https://www.google.com"]),
+            ("http_probe", ["curl.exe", "-sS", "-i", "-m", "10", HTTP_PROBE_URL]),
         ]
     if system == "Darwin":
         return [
@@ -62,7 +63,7 @@ def commands_for_platform(system: str) -> List[Command]:
             ("ping_name", ["ping", "-c", "3", "-t", "10", DNS_NAME]),
             ("dns_lookup", ["nslookup", DNS_NAME]),
             ("traceroute", ["traceroute", "-n", "-m", "15", "-w", "1", PING_IP]),
-            ("http_probe", ["curl", "-sS", "-I", "-m", "10", "https://www.google.com"]),
+            ("http_probe", ["curl", "-sS", "-i", "-m", "10", HTTP_PROBE_URL]),
         ]
     linux = [
         ("interfaces", ["ip", "addr"]),
@@ -72,7 +73,7 @@ def commands_for_platform(system: str) -> List[Command]:
         ("ping_name", ["ping", "-c", "3", "-W", "2", DNS_NAME]),
         ("dns_lookup", ["nslookup", DNS_NAME]),
         ("traceroute", ["traceroute", "-n", "-m", "15", "-w", "1", PING_IP]),
-        ("http_probe", ["curl", "-sS", "-I", "-m", "10", "https://www.google.com"]),
+        ("http_probe", ["curl", "-sS", "-i", "-m", "10", HTTP_PROBE_URL]),
     ]
     if system == "Linux":
         return linux
@@ -105,20 +106,41 @@ def run_command(argv: Sequence[str], timeout: float) -> CommandOutput:
     return CommandOutput(proc.returncode, _decode(proc.stdout), _decode(proc.stderr), None)
 
 
-def _decode(data: Union[bytes, str, None]) -> str:
+def _fallback_encoding(windows: Optional[bool] = None) -> str:
+    """Encoding for tool output that is not valid UTF-8.
+
+    Windows console tools (ipconfig, ping, tracert...) write in the OEM code
+    page when piped; elsewhere the locale encoding is the best guess.
+    """
+    if windows is None:
+        windows = os.name == "nt"
+    return "oem" if windows else (locale.getpreferredencoding(False) or "utf-8")
+
+
+def _decode(data: Union[bytes, str, None], fallback: Optional[str] = None) -> str:
     if data is None:
         return ""
     if isinstance(data, str):
         return data
-    # Windows consoles use OEM code pages; utf-8 with replacement never fails.
-    return data.decode("utf-8", errors="replace")
-
-
-_USERINFO = re.compile(r"(?<=://)[^/@\s]+@")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode(fallback or _fallback_encoding(), errors="replace")
+    except LookupError:
+        return data.decode("utf-8", errors="replace")
 
 
 def _redact(value: str) -> str:
-    return _USERINFO.sub("***@", value)
+    """Mask credentials in proxy settings (with or without a URL scheme)."""
+    scheme, sep, rest = value.partition("://")
+    if not sep:
+        scheme, rest = "", value
+    if "@" not in rest:
+        return value
+    hostpart = rest.rsplit("@", 1)[1]
+    return f"{scheme}{sep}***@{hostpart}"
 
 
 def _bounded(fn: Callable[[], object], timeout: float) -> object:

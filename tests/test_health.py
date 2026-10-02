@@ -7,9 +7,9 @@ def make_connector(results):
     """Fake connector: results maps (host, port) -> None (ok) or Exception."""
     calls = []
 
-    def connect(host, port, timeout):
-        calls.append((host, port, timeout))
-        outcome = results.get((host, port))
+    def connect(target, timeout):
+        calls.append((target.host, target.port, timeout))
+        outcome = results.get((target.host, target.port))
         if isinstance(outcome, Exception):
             raise outcome
 
@@ -95,8 +95,8 @@ def test_targets_are_checked_concurrently_within_a_deadline():
 
     release = threading.Event()
 
-    def blocking(host, port, timeout):
-        if host == "hang":
+    def blocking(target, timeout):
+        if target.host == "hang":
             release.wait(10)  # simulates resolver ignoring the timeout
             raise OSError("never")
 
@@ -160,15 +160,6 @@ def _serve_once(handler):
     return srv.getsockname()[1]
 
 
-def test_default_connector_verifies_tls_so_captive_portals_fail():
-    # A captive portal / transparent proxy accepts TCP but cannot present a
-    # valid certificate for the real host.
-    port = _serve_once(lambda conn: conn.sendall(b"HTTP/1.1 302 Found\r\nLocation: http://portal/\r\n\r\n"))
-    import pytest
-    with pytest.raises(OSError):  # ssl.SSLError is an OSError
-        health_mod.tls_connect("127.0.0.1", port, 3.0)
-
-
 def test_default_connector_shares_one_deadline_across_resolved_addresses(monkeypatch):
     import time
 
@@ -190,7 +181,7 @@ def test_default_connector_shares_one_deadline_across_resolved_addresses(monkeyp
     import pytest
     start = time.monotonic()
     with pytest.raises(OSError):
-        health_mod.tls_connect("example.com", 443, 0.6)
+        health_mod.tcp_connect("example.com", 443, 0.6)
     # IPv4 first, and a hanging IPv4 address must not starve the IPv6 one
     assert [a for a, _ in attempts] == ["192.0.2.1", "2001:db8::1"]
     assert time.monotonic() - start < 1.0
@@ -207,10 +198,93 @@ def test_slow_dns_resolution_is_bounded_and_classified_as_dns_failure(monkeypatc
     import pytest
     start = time.monotonic()
     with pytest.raises(socket.gaierror):
-        health_mod.tls_connect("example.com", 443, 0.5)
+        health_mod.tcp_connect("example.com", 443, 0.5)
     assert time.monotonic() - start < 2
 
 
-def test_default_connector_is_tls():
+def _serve_http(response: bytes):
+    def handler(conn):
+        conn.recv(4096)
+        conn.sendall(response)
+    return _serve_once(handler)
+
+
+def _http_target(port, status=204, body=None):
+    return Target("127.0.0.1", port, path="/generate_204", expect_status=status, expect_body=body)
+
+
+def test_http_probe_accepts_expected_status():
+    port = _serve_http(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+    health_mod.probe_target(_http_target(port), 3.0)  # no exception
+
+
+def test_http_probe_accepts_expected_body():
+    port = _serve_http(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nSuccess")
+    health_mod.probe_target(_http_target(port, 200, "Success"), 3.0)
+
+
+def test_http_probe_flags_captive_portal_redirect():
+    import pytest
+    port = _serve_http(b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/login\r\n\r\n")
+    with pytest.raises(health_mod.UnexpectedResponse) as info:
+        health_mod.probe_target(_http_target(port), 3.0)
+    assert "302" in str(info.value) and "portal.example" in str(info.value)
+
+
+def test_http_probe_flags_wrong_body():
+    import pytest
+    port = _serve_http(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n<html>login")
+    with pytest.raises(health_mod.UnexpectedResponse):
+        health_mod.probe_target(_http_target(port, 200, "Success"), 3.0)
+
+
+def test_http_probe_sends_host_header_and_path():
+    received = []
+
+    def handler(conn):
+        received.append(conn.recv(4096))
+        conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+
+    port = _serve_once(handler)
+    health_mod.probe_target(_http_target(port), 3.0)
+    assert received[0].startswith(b"GET /generate_204 HTTP/1.1\r\n")
+    assert b"Host: 127.0.0.1" in received[0]
+
+
+def test_plain_tcp_target_uses_tcp_connect():
+    port = _serve_once(lambda conn: None)
+    health_mod.probe_target(Target("127.0.0.1", port), 3.0)
+
+
+def test_unexpected_response_is_marked_and_hinted_in_summary():
+    def connector(target, timeout):
+        raise health_mod.UnexpectedResponse("HTTP 302 (Location: http://portal/)")
+
+    result = check_health([Target("x.example", 80, path="/", expect_status=204)], connector=connector)
+    assert result.results[0].unexpected_response is True
+    assert result.healthy is False
+    assert "captive portal" in result.summary().lower()
+
+
+def test_tcp_only_success_does_not_count_when_verified_probes_fail():
+    """Raw-IP TCP connects can be faked by portals/middleboxes; when HTTP
+    content probes are configured, at least one must succeed."""
+    targets = [Target("1.1.1.1", 443), Target("x.example", 80, path="/", expect_status=204)]
+    connector = make_connector({("x.example", 80): health_mod.UnexpectedResponse("HTTP 302")})
+    assert check_health(targets, connector=connector).healthy is False
+
+
+def test_default_targets_include_os_connectivity_check_endpoints():
+    http = [t for t in DEFAULT_TARGETS if t.path]
+    hosts = {t.host for t in http}
+    assert {"connectivitycheck.gstatic.com", "captive.apple.com", "www.msftconnecttest.com"} <= hosts
+    assert all(t.port == 80 and (t.expect_status or t.expect_body) for t in http)
+
+
+def test_default_connector_is_probe_target():
     import inspect
-    assert inspect.signature(check_health).parameters["connector"].default is health_mod.tls_connect
+    assert inspect.signature(check_health).parameters["connector"].default is health_mod.probe_target
+
+
+def test_target_str_for_http_target():
+    assert str(Target("h", 80, path="/p", expect_status=204)) == "http://h:80/p"

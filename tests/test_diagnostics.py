@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from network_checker import diagnostics as diag_mod
 from network_checker.diagnostics import (
     CommandOutput,
     commands_for_platform,
@@ -151,3 +152,32 @@ def test_proxy_credentials_are_redacted_in_logs(tmp_path, monkeypatch):
     assert "s3cret" not in path.read_text(encoding="utf-8")
     assert "s3cret" not in path.with_suffix(".json").read_text(encoding="utf-8")
     assert "proxy.example:8080" in path.read_text(encoding="utf-8")
+
+
+def test_decode_falls_back_to_console_code_page_for_localized_output():
+    raw = "Zeitüberschreitung der Anforderung".encode("cp850")
+    assert diag_mod._decode(raw, fallback="cp850") == "Zeitüberschreitung der Anforderung"
+
+
+def test_decode_prefers_utf8_when_valid():
+    assert diag_mod._decode("héllo".encode("utf-8"), fallback="cp850") == "héllo"
+
+
+def test_fallback_encoding_is_oem_on_windows():
+    assert diag_mod._fallback_encoding(windows=True) == "oem"
+    assert diag_mod._fallback_encoding(windows=False)  # some locale encoding
+
+
+def test_decode_survives_unknown_fallback_codec():
+    assert "ok" in diag_mod._decode(b"\xff ok", fallback="no-such-codec")
+
+
+@pytest.mark.parametrize("value", [
+    "user:" + "s3cret" + "@proxy.example:8080",                # no scheme
+    "http://user:pa/" + "s3cret" + "@proxy.example:8080",      # '/' in password
+    "socks5://" + "s3cret" + "@proxy.example:1080",
+])
+def test_redact_handles_schemeless_and_odd_passwords(value):
+    out = diag_mod._redact(value)
+    assert "s3cret" not in out
+    assert "proxy.example" in out
