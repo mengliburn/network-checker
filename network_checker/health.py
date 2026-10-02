@@ -1,12 +1,16 @@
 """Lightweight "ping-like" internet health check.
 
-ICMP ping usually requires elevated privileges, so reachability is checked by
-opening a TCP connection to highly available public endpoints instead.
+ICMP ping needs elevated privileges on some platforms, so reachability is
+checked by completing a *verified* TLS handshake with highly available public
+endpoints instead. Verifying the certificate means captive portals and
+transparent proxies (which accept any TCP connection) are not mistaken for a
+working internet connection. Works identically on Linux, macOS and Windows.
 """
 from __future__ import annotations
 
 import ipaddress
 import socket
+import ssl
 import threading
 import time
 from dataclasses import dataclass, field
@@ -37,6 +41,7 @@ class TargetResult:
     ok: bool
     latency_ms: float
     error: Optional[str] = None
+    dns_failure: bool = False
 
 
 @dataclass
@@ -45,11 +50,16 @@ class HealthResult:
 
     @property
     def dns_ok(self) -> Optional[bool]:
-        """True/False if any hostname target was checked, otherwise None."""
+        """True if a hostname target connected, False if every hostname target
+        failed specifically at name resolution, otherwise None (unknown)."""
         named = [r for r in self.results if not _is_ip(r.target.host)]
         if not named:
             return None
-        return any(r.ok for r in named)
+        if any(r.ok for r in named):
+            return True
+        if all(r.dns_failure for r in named):
+            return False
+        return None
 
     @property
     def healthy(self) -> bool:
@@ -75,7 +85,73 @@ def _is_ip(host: str) -> bool:
     return True
 
 
+def _resolve(host: str, port: int, timeout: float) -> list:
+    """getaddrinfo bounded by timeout (it otherwise ignores socket timeouts)."""
+    box: dict = {}
+
+    def run() -> None:
+        try:
+            box["infos"] = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except Exception as exc:
+            box["error"] = exc
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise socket.gaierror(f"DNS resolution of {host} timed out after {timeout:g}s")
+    if "error" in box:
+        raise box["error"]
+    if not box["infos"]:
+        raise socket.gaierror(f"no addresses for {host}")
+    return box["infos"]
+
+
+def _connect_addr(family: int, addr: tuple, timeout: float) -> socket.socket:
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(addr)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+def tls_connect(host: str, port: int, timeout: float) -> None:
+    """Resolve, connect and complete a certificate-verified TLS handshake.
+
+    A single deadline is shared by DNS, every resolved address (each gets a
+    fair share of the remaining time) and the TLS handshake. IPv4 is tried first so a host with broken IPv6 cannot burn the
+    whole budget on an unreachable AAAA address.
+    """
+    deadline = time.monotonic() + timeout
+    infos = _resolve(host, port, timeout)
+    infos.sort(key=lambda i: 0 if i[0] == socket.AF_INET else 1)
+    context = ssl.create_default_context()
+    last_error: Optional[BaseException] = None
+    for index, (family, _type, _proto, _canon, addr) in enumerate(infos):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # split what's left fairly so every address gets a chance
+        share = remaining / (len(infos) - index)
+        try:
+            sock = _connect_addr(family, addr, share)
+        except OSError as exc:
+            last_error = exc
+            continue
+        with sock:
+            sock.settimeout(max(0.001, deadline - time.monotonic()))
+            with context.wrap_socket(sock, server_hostname=host):
+                return
+    if last_error is not None:
+        raise last_error
+    raise socket.timeout(f"no address of {host} connected within {timeout:g}s")
+
+
 def tcp_connect(host: str, port: int, timeout: float) -> None:
+    """Plain TCP reachability (no TLS); usable for non-TLS custom targets."""
     with socket.create_connection((host, port), timeout=timeout):
         pass
 
@@ -86,13 +162,14 @@ def _probe(target: Target, connector: Connector, timeout: float) -> TargetResult
         connector(target.host, target.port, timeout)
     except Exception as exc:  # any failure means this target is unreachable
         error = f"{type(exc).__name__}: {exc}"
-        return TargetResult(target, False, (time.monotonic() - start) * 1000, error)
+        return TargetResult(target, False, (time.monotonic() - start) * 1000, error,
+                            dns_failure=isinstance(exc, (socket.gaierror, socket.herror)))
     return TargetResult(target, True, (time.monotonic() - start) * 1000)
 
 
 def check_health(
     targets: Iterable[Target] = DEFAULT_TARGETS,
-    connector: Connector = tcp_connect,
+    connector: Connector = tls_connect,
     timeout: float = 5.0,
 ) -> HealthResult:
     """Probe all targets concurrently, bounded by an overall deadline.

@@ -110,3 +110,107 @@ def test_targets_are_checked_concurrently_within_a_deadline():
     hung = result.results[0]
     assert hung.ok is False and "Timeout" in hung.error
     assert result.results[1].ok is True
+
+
+def test_non_dns_failure_on_hostname_target_is_not_reported_as_dns_failure():
+    targets = [Target("1.1.1.1", 443), Target("www.google.com", 443)]
+    connector = make_connector({("www.google.com", 443): ConnectionRefusedError("refused")})
+    result = check_health(targets, connector=connector)
+    assert result.results[1].dns_failure is False
+    assert result.dns_ok is not False
+    assert result.healthy is True
+    assert "DNS" not in result.summary()
+
+
+def test_gaierror_is_classified_as_dns_failure():
+    connector = make_connector({("www.google.com", 443): socket.gaierror(-3, "Temporary failure")})
+    result = check_health([Target("www.google.com", 443)], connector=connector)
+    assert result.results[0].dns_failure is True
+
+
+def test_dns_ok_true_when_any_hostname_target_connects():
+    connector = make_connector({("a.example", 1): socket.gaierror("x")})
+    result = check_health([Target("a.example", 1), Target("b.example", 2)], connector=connector)
+    assert result.dns_ok is True
+
+
+# ---- real default connector (TLS, shared deadline across addresses) ----
+
+import threading as _threading
+
+from network_checker import health as health_mod
+
+
+def _serve_once(handler):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+            with conn:
+                handler(conn)
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    _threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def test_default_connector_verifies_tls_so_captive_portals_fail():
+    # A captive portal / transparent proxy accepts TCP but cannot present a
+    # valid certificate for the real host.
+    port = _serve_once(lambda conn: conn.sendall(b"HTTP/1.1 302 Found\r\nLocation: http://portal/\r\n\r\n"))
+    import pytest
+    with pytest.raises(OSError):  # ssl.SSLError is an OSError
+        health_mod.tls_connect("127.0.0.1", port, 3.0)
+
+
+def test_default_connector_shares_one_deadline_across_resolved_addresses(monkeypatch):
+    import time
+
+    attempts = []
+
+    def fake_getaddrinfo(host, port, *a, **k):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", port)),
+        ]
+
+    def fake_attempt(family, addr, timeout):
+        attempts.append((addr[0], timeout))
+        time.sleep(timeout)  # every address hangs until its timeout
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(health_mod.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(health_mod, "_connect_addr", fake_attempt)
+    import pytest
+    start = time.monotonic()
+    with pytest.raises(OSError):
+        health_mod.tls_connect("example.com", 443, 0.6)
+    # IPv4 first, and a hanging IPv4 address must not starve the IPv6 one
+    assert [a for a, _ in attempts] == ["192.0.2.1", "2001:db8::1"]
+    assert time.monotonic() - start < 1.0
+
+
+def test_slow_dns_resolution_is_bounded_and_classified_as_dns_failure(monkeypatch):
+    import time
+
+    def hanging_getaddrinfo(*a, **k):
+        time.sleep(5)
+        return []
+
+    monkeypatch.setattr(health_mod.socket, "getaddrinfo", hanging_getaddrinfo)
+    import pytest
+    start = time.monotonic()
+    with pytest.raises(socket.gaierror):
+        health_mod.tls_connect("example.com", 443, 0.5)
+    assert time.monotonic() - start < 2
+
+
+def test_default_connector_is_tls():
+    import inspect
+    assert inspect.signature(check_health).parameters["connector"].default is health_mod.tls_connect
