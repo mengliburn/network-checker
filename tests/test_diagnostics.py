@@ -2,6 +2,7 @@ import datetime as dt
 import socket
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -107,6 +108,24 @@ class RunDiagnosticsTests(unittest.TestCase):
     def test_dns_failure_is_logged(self):
         content = self.run_diag(resolver=failing_resolver, dns_hosts=["www.google.com"]).read_text()
         self.assertIn("Name or service not known", content)
+
+    def test_hanging_dns_lookup_is_bounded_by_timeout(self):
+        def hanging_resolver(host, port):
+            time.sleep(2)
+            return []
+
+        start = time.monotonic()
+        content = self.run_diag(resolver=hanging_resolver, dns_hosts=["a.example", "b.example"], dns_timeout=0.1).read_text()
+        self.assertLess(time.monotonic() - start, 1.0)
+        self.assertIn("a.example: FAILED (timed out", content)
+        self.assertIn("b.example: FAILED (timed out", content)
+
+    def test_unwritable_log_dir_raises_oserror(self):
+        # Documented contract: callers (the monitor) handle OSError.
+        blocker = Path(self._tmp.name) / "file"
+        blocker.write_text("not a dir")
+        with self.assertRaises(OSError):
+            run_diagnostics(failed_health(), blocker / "logs", commands=[], dns_hosts=[])
 
     def test_does_not_overwrite_existing_log_with_same_timestamp(self):
         first = self.run_diag()

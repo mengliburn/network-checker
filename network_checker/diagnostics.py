@@ -12,6 +12,7 @@ import platform as _platform
 import socket
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence
@@ -88,14 +89,16 @@ def default_commands(platform: Optional[str] = None) -> List[DiagnosticCommand]:
     ]
 
 
-def _unique_log_path(log_dir: Path, timestamp: dt.datetime) -> Path:
+def _create_log_file(log_dir: Path, timestamp: dt.datetime):
+    """Atomically create a new, uniquely named log file (never overwrites)."""
     stem = f"diagnostics-{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
-    path = log_dir / f"{stem}.log"
-    counter = 1
-    while path.exists():
-        path = log_dir / f"{stem}-{counter}.log"
-        counter += 1
-    return path
+    counter = 0
+    while True:
+        path = log_dir / (f"{stem}.log" if counter == 0 else f"{stem}-{counter}.log")
+        try:
+            return path, open(path, "x", encoding="utf-8")
+        except FileExistsError:
+            counter += 1
 
 
 def _describe_command(cmd: DiagnosticCommand, runner: Runner, timeout: float) -> str:
@@ -114,11 +117,26 @@ def _describe_command(cmd: DiagnosticCommand, runner: Runner, timeout: float) ->
     return "\n".join(lines)
 
 
-def _describe_dns(host: str, resolver: Resolver) -> str:
-    try:
-        infos = resolver(host, 443)
-    except Exception as exc:  # noqa: BLE001
+def _describe_dns(host: str, resolver: Resolver, timeout: float) -> str:
+    # getaddrinfo has no timeout of its own and tends to hang exactly when the
+    # network is broken, so run it in a daemon thread and abandon it if slow.
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["infos"] = resolver(host, 443)
+        except Exception as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, name=f"dns-{host}", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        return f"{host}: FAILED (timed out after {timeout}s)"
+    if "error" in box:
+        exc = box["error"]
         return f"{host}: FAILED ({type(exc).__name__}: {exc})"
+    infos = box.get("infos") or []
     addresses = sorted({info[4][0] for info in infos})
     return f"{host}: {', '.join(addresses) or '(no addresses)'}"
 
@@ -131,16 +149,21 @@ def run_diagnostics(
     resolver: Resolver = socket.getaddrinfo,
     dns_hosts: Iterable[str] = DEFAULT_DNS_HOSTS,
     command_timeout: float = 30.0,
+    dns_timeout: float = 10.0,
     now: Callable[[], dt.datetime] = lambda: dt.datetime.now(dt.timezone.utc),
 ) -> Path:
-    """Run diagnostics and write them to a new log file. Returns its path."""
+    """Run diagnostics and write them to a new log file. Returns its path.
+
+    Individual diagnostics never raise; failures are recorded in the log.
+    An ``OSError`` is raised only if the log itself cannot be written.
+    """
     commands = default_commands() if commands is None else list(commands)
     timestamp = now()
     log_dir = Path(log_dir)
     log_dir.mkdir(parents=True, exist_ok=True)
-    path = _unique_log_path(log_dir, timestamp)
+    path, log = _create_log_file(log_dir, timestamp)
 
-    with open(path, "x", encoding="utf-8") as log:
+    with log:
 
         def section(title: str, body: str) -> None:
             log.write(f"===== {title} =====\n{body}\n\n")
@@ -152,7 +175,7 @@ def run_diagnostics(
             f"host: {socket.gethostname()} ({_platform.platform()})\n\n"
             f"{health.summary()}",
         )
-        section("dns resolution", "\n".join(_describe_dns(h, resolver) for h in dns_hosts))
+        section("dns resolution", "\n".join(_describe_dns(h, resolver, dns_timeout) for h in dns_hosts))
         for cmd in commands:
             section(f"{cmd.name}: {' '.join(cmd.argv)}", _describe_command(cmd, runner, command_timeout))
     return path
