@@ -12,7 +12,9 @@ import platform
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,52 +104,59 @@ def _kill_tree(proc: "subprocess.Popen") -> None:
         proc.kill()
     except OSError:
         pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+MAX_OUTPUT_BYTES = 1024 * 1024
+POLL_INTERVAL = 0.1
 
 
 def run_command(argv: Sequence[str], timeout: float) -> CommandOutput:
     """Run argv (no shell) and capture output; never raises (except Ctrl+C).
 
-    The child gets its own process group so that on timeout the whole tree is
-    killed; otherwise a lingering grandchild holding the output pipes could
-    block us forever (notably on Windows).
+    Output goes to temporary files rather than pipes, so a lingering
+    grandchild that inherited stdout cannot block us, and the wait is done in
+    short slices so Ctrl+C stays responsive on every platform. On timeout or
+    interrupt the whole process tree is killed.
     """
     kwargs: dict = {}
-    if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        kwargs["start_new_session"] = True
-    try:
-        proc = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL, **kwargs)
-    except FileNotFoundError:
-        return CommandOutput(None, "", "", f"command not found: {argv[0]}")
-    except Exception as exc:
-        return CommandOutput(None, "", "", f"{type(exc).__name__}: {exc}")
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
-        stdout, stderr = _drain(proc)
-        return CommandOutput(None, _decode(stdout), _decode(stderr),
-                             f"timed out after {timeout:g}s")
-    except BaseException:
-        _kill_tree(proc)
-        _drain(proc)
-        raise
-    return CommandOutput(proc.returncode, _decode(stdout), _decode(stderr), None)
+    if os.name != "nt":
+        kwargs["start_new_session"] = True  # lets us killpg the whole tree
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        try:
+            proc = subprocess.Popen(list(argv), stdout=out_f, stderr=err_f,
+                                    stdin=subprocess.DEVNULL, **kwargs)
+        except FileNotFoundError:
+            return CommandOutput(None, "", "", f"command not found: {argv[0]}")
+        except Exception as exc:
+            return CommandOutput(None, "", "", f"{type(exc).__name__}: {exc}")
+
+        deadline = time.monotonic() + timeout
+        error = None
+        try:
+            while True:
+                try:
+                    proc.wait(timeout=POLL_INTERVAL)
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        _kill_tree(proc)
+                        error = f"timed out after {timeout:g}s"
+                        break
+        except BaseException:
+            _kill_tree(proc)
+            raise
+        stdout, stderr = _read_back(out_f), _read_back(err_f)
+    returncode = None if error else proc.returncode
+    return CommandOutput(returncode, _decode(stdout), _decode(stderr), error)
 
 
-def _drain(proc: "subprocess.Popen") -> tuple:
-    try:
-        return proc.communicate(timeout=5)
-    except Exception:
-        for pipe in (proc.stdout, proc.stderr):
-            try:
-                if pipe:
-                    pipe.close()
-            except OSError:
-                pass
-        return b"", b""
+def _read_back(f) -> bytes:
+    f.seek(0)
+    return f.read(MAX_OUTPUT_BYTES)
 
 
 def _fallback_encoding(windows: Optional[bool] = None) -> str:

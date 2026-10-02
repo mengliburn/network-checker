@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 from typing import List, Optional
 
@@ -12,6 +13,35 @@ from .health import DEFAULT_TARGETS, Target, check_health
 from .monitor import Monitor
 
 AGENT_ENV = "NETWORK_CHECKER_AGENT_CMD"
+
+# Signals that should stop the monitor through the same clean path as Ctrl+C
+# (which also kills any running diagnostic/agent process tree).
+TERMINATION_SIGNALS = tuple(
+    getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, name)
+)
+
+
+def _raise_interrupt(signum, frame):
+    raise KeyboardInterrupt(f"received signal {signum}")
+
+
+def install_signal_handlers() -> dict:
+    """Install handlers; returns the previous ones for restore_signal_handlers."""
+    previous = {}
+    for sig in TERMINATION_SIGNALS:
+        try:
+            previous[sig] = signal.signal(sig, _raise_interrupt)
+        except (ValueError, OSError):  # not main thread / unsupported
+            pass
+    return previous
+
+
+def restore_signal_handlers(previous: dict) -> None:
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError, TypeError):
+            pass
 
 
 def parse_target(value: str) -> Target:
@@ -87,12 +117,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         cooldown=args.cooldown,
         echo=(lambda line: None) if args.quiet else (lambda line: print(line, flush=True)),
     )
+    previous_handlers = install_signal_handlers()
     try:
         if args.once:
             return 0 if monitor.run_once().healthy else 1
         monitor.run_forever(args.interval)
     except KeyboardInterrupt:
         return 0
+    finally:
+        restore_signal_handlers(previous_handlers)
     return 0
 
 

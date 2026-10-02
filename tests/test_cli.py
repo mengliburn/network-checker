@@ -108,3 +108,30 @@ def test_no_default_targets_requires_a_target(tmp_path):
     with pytest.raises(SystemExit) as info:
         cli.main(["--once", "--log-dir", str(tmp_path), "--no-default-targets"])
     assert info.value.code == 2
+
+
+def test_termination_signals_trigger_clean_shutdown_path():
+    import signal
+
+    saved = {s: signal.getsignal(s) for s in cli.TERMINATION_SIGNALS}
+    try:
+        cli.install_signal_handlers()
+        assert signal.SIGTERM in cli.TERMINATION_SIGNALS
+        for sig in cli.TERMINATION_SIGNALS:
+            with pytest.raises(KeyboardInterrupt):
+                signal.getsignal(sig)(sig, None)
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+
+def test_main_restores_previous_signal_handlers(monkeypatch, tmp_path):
+    import signal
+    _patch(monkeypatch, True, tmp_path)
+    sentinel = lambda signum, frame: None
+    previous = signal.signal(signal.SIGTERM, sentinel)
+    try:
+        cli.main(["--once", "--log-dir", str(tmp_path)])
+        assert signal.getsignal(signal.SIGTERM) is sentinel
+    finally:
+        signal.signal(signal.SIGTERM, previous)

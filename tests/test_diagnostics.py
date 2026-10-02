@@ -206,3 +206,54 @@ def test_run_command_timeout_kills_whole_process_tree(tmp_path):
     time.sleep(1.0)
     after = heartbeat.stat().st_size if heartbeat.exists() else 0
     assert after == size, "grandchild process survived the timeout"
+
+
+def test_run_command_returns_when_child_exits_even_if_grandchild_keeps_output_open():
+    import time
+    grandchild = "import time; time.sleep(30)"
+    child = (
+        "import subprocess, sys\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}])\n"
+        "print('child done', flush=True)\n"
+    )
+    start = time.monotonic()
+    out = run_command([sys.executable, "-c", child], timeout=25)
+    assert time.monotonic() - start < 10
+    assert out.returncode == 0 and out.error is None
+    assert "child done" in out.stdout
+
+
+def test_ctrl_c_interrupts_a_running_command_promptly_and_kills_it(tmp_path):
+    import _thread
+    import threading
+    import time
+    marker = tmp_path / "alive.txt"
+    code = (
+        "import time, sys\n"
+        "while True:\n"
+        f"    open({str(marker)!r}, 'a').write('x'); time.sleep(0.05)\n"
+    )
+    timer = threading.Timer(0.7, _thread.interrupt_main)
+    timer.start()
+    start = time.monotonic()
+    with pytest.raises(KeyboardInterrupt):
+        run_command([sys.executable, "-c", code], timeout=60)
+    assert time.monotonic() - start < 10
+    time.sleep(0.5)
+    size = marker.stat().st_size if marker.exists() else 0
+    time.sleep(0.8)
+    assert (marker.stat().st_size if marker.exists() else 0) == size, "child survived Ctrl+C"
+
+
+def test_windows_child_shares_console_group_so_it_receives_ctrl_c(monkeypatch):
+    captured = {}
+
+    class FakePopen:
+        def __init__(self, argv, **kw):
+            captured.update(kw)
+            raise FileNotFoundError
+
+    monkeypatch.setattr(diag_mod.os, "name", "nt")
+    monkeypatch.setattr(diag_mod.subprocess, "Popen", FakePopen)
+    run_command(["x"], timeout=1)
+    assert "creationflags" not in captured and "start_new_session" not in captured
