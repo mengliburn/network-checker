@@ -162,11 +162,37 @@ def _read_back(f) -> bytes:
     if size <= MAX_OUTPUT_BYTES:
         return f.read()
     half = MAX_OUTPUT_BYTES // 2
-    head = f.read(half)
+    head = _trim_partial_utf8_end(f.read(half))
     f.seek(size - half)
-    tail = f.read()
-    marker = f"\n[... {size - 2 * half} bytes truncated ...]\n".encode("ascii")
+    tail = _trim_partial_utf8_start(f.read())
+    marker = f"\n[... {size - len(head) - len(tail)} bytes truncated ...]\n".encode("ascii")
     return head + marker + tail
+
+
+def _is_continuation(byte: int) -> bool:
+    return byte & 0xC0 == 0x80
+
+
+def _trim_partial_utf8_start(data: bytes) -> bytes:
+    """Drop UTF-8 continuation bytes left over from a cut character."""
+    i = 0
+    while i < min(len(data), 3) and _is_continuation(data[i]):
+        i += 1
+    return data[i:]
+
+
+def _trim_partial_utf8_end(data: bytes) -> bytes:
+    """Drop an incomplete trailing UTF-8 sequence (harmless for 1-byte codepages
+    except possibly losing one character at the cut)."""
+    for back in range(1, min(len(data), 4) + 1):
+        byte = data[-back]
+        if not _is_continuation(byte):
+            if byte >= 0xC0:  # lead byte: is its sequence complete?
+                needed = 2 if byte < 0xE0 else 3 if byte < 0xF0 else 4
+                if back < needed:
+                    return data[:-back]
+            return data
+    return data
 
 
 def _fallback_encoding(windows: Optional[bool] = None) -> str:

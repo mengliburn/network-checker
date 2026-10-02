@@ -272,3 +272,15 @@ def test_large_output_keeps_head_and_tail_with_truncation_marker(monkeypatch):
 def test_small_output_is_not_marked_truncated():
     out = run_command([sys.executable, "-c", "print('hi')"], timeout=30)
     assert "truncated" not in out.stdout
+
+
+@pytest.mark.parametrize("limit", [1000, 1001, 1002, 1003])
+def test_truncation_cuts_on_utf8_character_boundaries(monkeypatch, limit):
+    monkeypatch.setattr(diag_mod, "MAX_OUTPUT_BYTES", limit)
+    code = "import sys; sys.stdout.buffer.write(('é€' * 2000).encode('utf-8'))"
+    out = run_command([sys.executable, "-c", code], timeout=30)
+    assert "\ufffd" not in out.stdout
+    body = out.stdout.replace("\n", "")
+    head, _, tail = body.partition("[")
+    assert set(head) <= {"é", "€"} and head
+    assert set(tail.split("]")[-1]) <= {"é", "€"}

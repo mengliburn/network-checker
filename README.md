@@ -47,9 +47,13 @@ python -m network_checker --no-default-targets --target 10.0.0.1:53
 ```
 
 Exit codes: `0` = healthy, `1` = unhealthy, `2` = usage error (including a
-malformed agent command). An interrupted run returns `128 + signal`, e.g. `130`
-for Ctrl+C or `143` for SIGTERM, so it is never mistaken for healthy. On
-interrupt, any running diagnostic or agent process tree is killed.
+malformed agent command). An interrupted run returns `128 + signal`, so it is never mistaken for
+healthy, and any running diagnostic or agent process tree is killed:
+
+* Linux/macOS: Ctrl+C gives `130`, SIGTERM `143`, SIGHUP `129`.
+* Windows: Ctrl+C gives `130`, Ctrl+Break `149`. Windows cannot deliver
+  SIGTERM to another process: `taskkill /F` and `os.kill` terminate the
+  process immediately, so no clean-up runs.
 
 ### Configuring the agent
 
