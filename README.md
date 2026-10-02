@@ -15,7 +15,9 @@ A small, dependency-free (Python 3.8+ standard library only) internet/network he
    Every outcome is written to `logs/diagnostics-*.agent.log` and never crashes the monitor.
 
 While an outage lasts, diagnostics are collected at most once per `--cooldown` seconds (default 900). After the
-network recovers, the next failure is diagnosed immediately. A running history is kept in `logs/network-checker.log`.
+network recovers, the next failure is diagnosed immediately. The cooldown is persisted in
+`logs/network-checker.state.json`, so it also holds across separate `--once` runs (for example from cron). A running
+history is kept in `logs/network-checker.log`.
 
 ## Usage
 

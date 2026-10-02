@@ -103,6 +103,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.agent_cmd
         else None,
         cooldown=args.cooldown,
+        state_path=args.log_dir / "network-checker.state.json",
     )
     if args.once:
         return 0 if monitor.run_once().healthy else 1

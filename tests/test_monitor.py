@@ -1,4 +1,5 @@
 import logging
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,7 +20,7 @@ class Clock:
 
 
 class Harness:
-    def __init__(self, results, cooldown=600.0):
+    def __init__(self, results, cooldown=600.0, state_path=None):
         self.results = list(results)
         self.diagnosed = []
         self.agent_calls = []
@@ -35,6 +36,7 @@ class Harness:
             cooldown=cooldown,
             clock=self.clock,
             sleep=self.sleep,
+            state_path=state_path,
         )
 
     def check(self):
@@ -136,6 +138,38 @@ class MonitorRunOnceTests(QuietTestCase):
         cycle = h.monitor.run_once()
         self.assertIsNotNone(cycle.log_path)
         self.assertIsNone(cycle.agent_outcome)
+
+
+class MonitorPersistentCooldownTests(QuietTestCase):
+    """--once runs are separate processes; cooldown must survive between them."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name) / "state.json"
+
+    def test_cooldown_persists_across_monitor_instances(self):
+        first = Harness([DOWN], cooldown=600, state_path=self.state)
+        self.assertIsNotNone(first.monitor.run_once().log_path)
+        second = Harness([DOWN], cooldown=600, state_path=self.state)
+        second.clock.now = first.clock.now + 60
+        self.assertIsNone(second.monitor.run_once().log_path)
+        third = Harness([DOWN], cooldown=600, state_path=self.state)
+        third.clock.now = first.clock.now + 601
+        self.assertIsNotNone(third.monitor.run_once().log_path)
+
+    def test_recovery_clears_persisted_cooldown(self):
+        Harness([DOWN], state_path=self.state).monitor.run_once()
+        Harness([UP], state_path=self.state).monitor.run_once()
+        later = Harness([DOWN], state_path=self.state)
+        self.assertIsNotNone(later.monitor.run_once().log_path)
+
+    def test_corrupt_or_unwritable_state_is_ignored(self):
+        self.state.write_text("{not json")
+        self.assertIsNotNone(Harness([DOWN], state_path=self.state).monitor.run_once().log_path)
+        unwritable = self.state / "nested" / "state.json"  # parent is a file
+        self.assertIsNotNone(Harness([DOWN], state_path=unwritable).monitor.run_once().log_path)
 
 
 class MonitorRunForeverTests(QuietTestCase):

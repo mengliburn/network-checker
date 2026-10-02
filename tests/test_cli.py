@@ -83,6 +83,13 @@ class MainOnceTests(unittest.TestCase):
         self.assertIn("exit code 2", agent_log)
         self.assertTrue((self.log_dir / "network-checker.log").exists())
 
+    def test_repeated_once_runs_respect_cooldown(self):
+        argv = ["--once", "-q", "-t", f"127.0.0.1:{closed_port()}", "--log-dir", str(self.log_dir), "--no-agent"]
+        with mock.patch.object(cli, "default_commands", return_value=QUICK_COMMANDS):
+            self.assertEqual(cli.main(argv), 1)
+            self.assertEqual(cli.main(argv), 1)
+        self.assertEqual(len(list(self.log_dir.glob("diagnostics-*.log"))), 1)
+
     def test_once_unhealthy_with_missing_agent_still_completes(self):
         with mock.patch.object(cli, "default_commands", return_value=QUICK_COMMANDS):
             code = cli.main(

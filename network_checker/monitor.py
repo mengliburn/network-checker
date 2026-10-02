@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -28,7 +29,9 @@ class Monitor:
 
     While an outage persists, diagnostics are re-collected at most once per
     ``cooldown`` seconds. After recovery, the next failure is diagnosed
-    immediately. No step is allowed to crash the loop.
+    immediately. If ``state_path`` is given the cooldown is persisted there, so
+    it also holds across separate ``--once`` (e.g. cron) runs. ``clock`` must
+    then be wall-clock time. No step is allowed to crash the loop.
     """
 
     def __init__(
@@ -37,8 +40,9 @@ class Monitor:
         diagnose: Callable[[HealthResult], Path],
         agent: Optional[Callable[[Path], AgentOutcome]] = None,
         cooldown: float = 900.0,
-        clock: Callable[[], float] = time.monotonic,
+        clock: Callable[[], float] = time.time,
         sleep: Callable[[float], None] = time.sleep,
+        state_path: Optional[Path] = None,
     ):
         self.check = check
         self.diagnose = diagnose
@@ -46,7 +50,26 @@ class Monitor:
         self.cooldown = cooldown
         self.clock = clock
         self.sleep = sleep
-        self._last_diagnosed: Optional[float] = None
+        self.state_path = Path(state_path) if state_path is not None else None
+        self._last_diagnosed: Optional[float] = self._load_state()
+
+    def _load_state(self) -> Optional[float]:
+        if self.state_path is None:
+            return None
+        try:
+            value = json.loads(self.state_path.read_text(encoding="utf-8"))["last_diagnosed"]
+            return float(value) if value is not None else None
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _set_last_diagnosed(self, value: Optional[float]) -> None:
+        self._last_diagnosed = value
+        if self.state_path is None:
+            return
+        try:
+            self.state_path.write_text(json.dumps({"last_diagnosed": value}), encoding="utf-8")
+        except OSError as exc:
+            log.warning("cannot persist monitor state to %s: %s", self.state_path, exc)
 
     def run_once(self) -> CycleResult:
         try:
@@ -61,16 +84,16 @@ class Monitor:
         if health.healthy:
             if self._last_diagnosed is not None:
                 log.info("network recovered")
-            self._last_diagnosed = None
+                self._set_last_diagnosed(None)
             log.info("network healthy\n%s", health.summary())
             return CycleResult(True, health)
 
         log.warning("network health check FAILED\n%s", health.summary() or health_error)
         now = self.clock()
-        if self._last_diagnosed is not None and now - self._last_diagnosed < self.cooldown:
+        if self._last_diagnosed is not None and 0 <= now - self._last_diagnosed < self.cooldown:
             log.info("outage continues; diagnostics already collected %.0fs ago", now - self._last_diagnosed)
             return CycleResult(False, health, error=health_error)
-        self._last_diagnosed = now
+        self._set_last_diagnosed(now)
 
         try:
             log_path = self.diagnose(health)
@@ -99,5 +122,6 @@ class Monitor:
                 results.append(result)
                 if len(results) >= max_cycles:
                     break
-            self.sleep(max(0.0, interval - (self.clock() - started)))
+            elapsed = self.clock() - started
+            self.sleep(min(interval, max(0.0, interval - elapsed)))
         return results
