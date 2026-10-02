@@ -38,13 +38,18 @@ Repeated diagnostics during one long outage are rate-limited by `--cooldown`.
 
 ```sh
 python -m network_checker                 # monitor every 60s (Ctrl+C to stop)
-python -m network_checker --once          # single check; exit code 0 = healthy, 1 = unhealthy
+python -m network_checker --once          # single check (see exit codes below)
 python -m network_checker --interval 30 --log-dir /var/log/netcheck
 # add extra TCP probes (the built-in content-verified checks stay on)
 python -m network_checker --target intranet.example:443 --target [2606:4700:4700::1111]:443
 # probe only your own endpoints (TCP connect only: a captive portal may look healthy)
 python -m network_checker --no-default-targets --target 10.0.0.1:53
 ```
+
+Exit codes: `0` = healthy, `1` = unhealthy, `2` = usage error (including a
+malformed agent command). An interrupted run returns `128 + signal`, e.g. `130`
+for Ctrl+C or `143` for SIGTERM, so it is never mistaken for healthy. On
+interrupt, any running diagnostic or agent process tree is killed.
 
 ### Configuring the agent
 
@@ -65,7 +70,8 @@ python -m network_checker
 
 The command runs without a shell. If it is still running after
 `--agent-timeout` seconds (default 600), it is killed along with all its child
-processes. A malformed command, such as one with unbalanced quotes, is rejected
+processes. Very large output is trimmed to the first and last 512 KiB, with a
+`[... N bytes truncated ...]` marker in between. A malformed command, such as one with unbalanced quotes, is rejected
 at startup with exit code 2.
 
 On Windows the program name is looked up with `PATHEXT`, so `.cmd` shims

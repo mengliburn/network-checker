@@ -257,3 +257,18 @@ def test_windows_child_shares_console_group_so_it_receives_ctrl_c(monkeypatch):
     monkeypatch.setattr(diag_mod.subprocess, "Popen", FakePopen)
     run_command(["x"], timeout=1)
     assert "creationflags" not in captured and "start_new_session" not in captured
+
+
+def test_large_output_keeps_head_and_tail_with_truncation_marker(monkeypatch):
+    monkeypatch.setattr(diag_mod, "MAX_OUTPUT_BYTES", 1000)
+    code = "import sys; sys.stdout.write('HEAD' + 'x' * 5000 + 'FINAL-DIAGNOSIS')"
+    out = run_command([sys.executable, "-c", code], timeout=30)
+    assert out.stdout.startswith("HEAD")
+    assert out.stdout.endswith("FINAL-DIAGNOSIS")
+    assert "truncated" in out.stdout
+    assert len(out.stdout) < 1200
+
+
+def test_small_output_is_not_marked_truncated():
+    out = run_command([sys.executable, "-c", "print('hi')"], timeout=30)
+    assert "truncated" not in out.stdout

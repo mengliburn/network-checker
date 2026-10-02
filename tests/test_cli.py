@@ -62,14 +62,25 @@ def test_agent_cmd_can_come_from_environment(monkeypatch, tmp_path):
     assert calls["agent"][0] == "env-agent"
 
 
-def test_ctrl_c_exits_cleanly(monkeypatch, tmp_path):
+def test_ctrl_c_exits_cleanly_with_conventional_code(monkeypatch, tmp_path):
     _patch(monkeypatch, True, tmp_path)
 
     def interrupt(*a, **k):
         raise KeyboardInterrupt
 
     monkeypatch.setattr(cli.Monitor, "run_forever", interrupt)
-    assert cli.main(["--log-dir", str(tmp_path)]) == 0
+    assert cli.main(["--log-dir", str(tmp_path)]) == 130
+
+
+def test_interrupted_once_run_is_never_reported_as_healthy(monkeypatch, tmp_path):
+    import signal
+    _patch(monkeypatch, True, tmp_path)
+
+    def terminated(*a, **k):
+        cli._raise_interrupt(signal.SIGTERM, None)
+
+    monkeypatch.setattr(cli.Monitor, "run_once", terminated)
+    assert cli.main(["--once", "--log-dir", str(tmp_path)]) == 128 + int(signal.SIGTERM)
 
 
 def test_module_is_runnable_with_python_dash_m():
@@ -82,7 +93,7 @@ def test_module_is_runnable_with_python_dash_m():
 def test_malformed_agent_command_is_a_usage_error_not_a_crash(monkeypatch, tmp_path, capsys):
     _patch(monkeypatch, True, tmp_path)
     with pytest.raises(SystemExit) as info:
-        cli.main(["--once", "--log-dir", str(tmp_path), "--agent-cmd", "agent 'x"])
+        cli.main(["--once", "--log-dir", str(tmp_path), "--agent-cmd", 'agent "x'])
     assert info.value.code == 2
     assert "agent" in capsys.readouterr().err.lower()
 

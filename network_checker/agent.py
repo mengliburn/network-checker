@@ -95,6 +95,8 @@ def _split_windows(cmdline: str) -> List[str]:
         current.append(c)
         in_arg = True
         i += 1
+    if in_quotes:
+        raise ValueError("No closing quotation")
     if in_arg:
         args.append("".join(current))
     return args

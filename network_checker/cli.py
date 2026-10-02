@@ -21,8 +21,14 @@ TERMINATION_SIGNALS = tuple(
 )
 
 
+class Terminated(KeyboardInterrupt):
+    def __init__(self, signum: int):
+        super().__init__(f"received signal {signum}")
+        self.signum = int(signum)
+
+
 def _raise_interrupt(signum, frame):
-    raise KeyboardInterrupt(f"received signal {signum}")
+    raise Terminated(signum)
 
 
 def install_signal_handlers() -> dict:
@@ -122,8 +128,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.once:
             return 0 if monitor.run_once().healthy else 1
         monitor.run_forever(args.interval)
-    except KeyboardInterrupt:
-        return 0
+    except KeyboardInterrupt as exc:
+        # conventional 128+signal codes; never 0, which --once uses for "healthy"
+        return 128 + getattr(exc, "signum", int(signal.SIGINT))
     finally:
         restore_signal_handlers(previous_handlers)
     return 0

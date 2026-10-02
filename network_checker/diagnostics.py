@@ -155,8 +155,18 @@ def run_command(argv: Sequence[str], timeout: float) -> CommandOutput:
 
 
 def _read_back(f) -> bytes:
+    """Return the output, keeping head and tail if it exceeds MAX_OUTPUT_BYTES
+    (agents usually print their conclusion last)."""
+    size = f.seek(0, os.SEEK_END)
     f.seek(0)
-    return f.read(MAX_OUTPUT_BYTES)
+    if size <= MAX_OUTPUT_BYTES:
+        return f.read()
+    half = MAX_OUTPUT_BYTES // 2
+    head = f.read(half)
+    f.seek(size - half)
+    tail = f.read()
+    marker = f"\n[... {size - 2 * half} bytes truncated ...]\n".encode("ascii")
+    return head + marker + tail
 
 
 def _fallback_encoding(windows: Optional[bool] = None) -> str:

@@ -154,3 +154,14 @@ def test_parse_agent_command_windows_follows_commandlinetoargv_rules():
     assert parse_agent_command('agent --prompt="{prompt}"', windows=True) == ["agent", "--prompt={prompt}"]
     assert parse_agent_command('agent "a""b"', windows=True) == ["agent", 'a"b']
     assert parse_agent_command(r'agent C:\dir\ "x y"', windows=True) == ["agent", "C:\\dir\\", "x y"]
+
+
+def test_parse_agent_command_windows_rejects_unterminated_double_quote():
+    with pytest.raises(ValueError):
+        parse_agent_command(r'"C:\Program Files\agent.exe --log {log}', windows=True)
+
+
+def test_parse_agent_command_rejects_unterminated_double_quote_on_every_platform():
+    for windows in (True, False):
+        with pytest.raises(ValueError):
+            parse_agent_command('agent "x', windows=windows)
