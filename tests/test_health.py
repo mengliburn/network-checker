@@ -1,0 +1,290 @@
+import socket
+
+from network_checker.health import DEFAULT_TARGETS, Target, check_health
+
+
+def make_connector(results):
+    """Fake connector: results maps (host, port) -> None (ok) or Exception."""
+    calls = []
+
+    def connect(target, timeout):
+        calls.append((target.host, target.port, timeout))
+        outcome = results.get((target.host, target.port))
+        if isinstance(outcome, Exception):
+            raise outcome
+
+    connect.calls = calls
+    return connect
+
+
+def test_default_targets_use_reliable_public_providers():
+    hosts = {t.host for t in DEFAULT_TARGETS}
+    assert {"1.1.1.1", "8.8.8.8"} <= hosts
+    assert len(DEFAULT_TARGETS) >= 3
+
+
+def test_healthy_when_all_targets_reachable():
+    targets = [Target("a", 1), Target("b", 2)]
+    result = check_health(targets, connector=make_connector({}), timeout=2.0)
+    assert result.healthy is True
+    assert [r.ok for r in result.results] == [True, True]
+
+
+def test_healthy_when_at_least_one_target_reachable():
+    targets = [Target("a", 1), Target("b", 2)]
+    connector = make_connector({("a", 1): socket.timeout("timed out")})
+    result = check_health(targets, connector=connector)
+    assert result.healthy is True
+    assert result.results[0].ok is False
+    assert "timed out" in result.results[0].error
+
+
+def test_unhealthy_when_every_target_fails():
+    targets = [Target("a", 1), Target("b", 2)]
+    connector = make_connector({
+        ("a", 1): OSError("Network is unreachable"),
+        ("b", 2): socket.gaierror("Name or service not known"),
+    })
+    result = check_health(targets, connector=connector)
+    assert result.healthy is False
+    assert all(not r.ok for r in result.results)
+    assert "unreachable" in result.results[0].error
+
+
+def test_passes_timeout_to_connector():
+    connector = make_connector({})
+    check_health([Target("a", 1)], connector=connector, timeout=3.5)
+    assert connector.calls == [("a", 1, 3.5)]
+
+
+def test_records_latency_for_each_target():
+    result = check_health([Target("a", 1)], connector=make_connector({}))
+    assert result.results[0].latency_ms >= 0
+
+
+def test_empty_target_list_is_unhealthy():
+    assert check_health([], connector=make_connector({})).healthy is False
+
+
+def test_result_summary_is_human_readable():
+    connector = make_connector({("b", 2): OSError("refused")})
+    result = check_health([Target("a", 1), Target("b", 2)], connector=connector)
+    summary = result.summary()
+    assert "a:1 OK" in summary
+    assert "b:2 FAIL" in summary and "refused" in summary
+
+
+def test_dns_failure_alone_makes_check_unhealthy():
+    targets = [Target("1.1.1.1", 443), Target("8.8.8.8", 443), Target("www.google.com", 443)]
+    connector = make_connector({("www.google.com", 443): socket.gaierror("Temporary failure in name resolution")})
+    result = check_health(targets, connector=connector)
+    assert result.dns_ok is False
+    assert result.healthy is False
+    assert "DNS" in result.summary()
+
+
+def test_ip_only_targets_do_not_require_dns():
+    result = check_health([Target("1.1.1.1", 443)], connector=make_connector({}))
+    assert result.dns_ok is None
+    assert result.healthy is True
+
+
+def test_targets_are_checked_concurrently_within_a_deadline():
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def blocking(target, timeout):
+        if target.host == "hang":
+            release.wait(10)  # simulates resolver ignoring the timeout
+            raise OSError("never")
+
+    try:
+        start = time.monotonic()
+        result = check_health([Target("hang", 1), Target("1.1.1.1", 2)], connector=blocking, timeout=0.3)
+        elapsed = time.monotonic() - start
+    finally:
+        release.set()
+    assert elapsed < 2
+    hung = result.results[0]
+    assert hung.ok is False and "Timeout" in hung.error
+    assert result.results[1].ok is True
+
+
+def test_non_dns_failure_on_hostname_target_is_not_reported_as_dns_failure():
+    targets = [Target("1.1.1.1", 443), Target("www.google.com", 443)]
+    connector = make_connector({("www.google.com", 443): ConnectionRefusedError("refused")})
+    result = check_health(targets, connector=connector)
+    assert result.results[1].dns_failure is False
+    assert result.dns_ok is not False
+    assert result.healthy is True
+    assert "DNS" not in result.summary()
+
+
+def test_gaierror_is_classified_as_dns_failure():
+    connector = make_connector({("www.google.com", 443): socket.gaierror(-3, "Temporary failure")})
+    result = check_health([Target("www.google.com", 443)], connector=connector)
+    assert result.results[0].dns_failure is True
+
+
+def test_dns_ok_true_when_any_hostname_target_connects():
+    connector = make_connector({("a.example", 1): socket.gaierror("x")})
+    result = check_health([Target("a.example", 1), Target("b.example", 2)], connector=connector)
+    assert result.dns_ok is True
+
+
+# ---- real default connector (TLS, shared deadline across addresses) ----
+
+import threading as _threading
+
+from network_checker import health as health_mod
+
+
+def _serve_once(handler):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def run():
+        try:
+            conn, _ = srv.accept()
+            with conn:
+                handler(conn)
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    _threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def test_default_connector_shares_one_deadline_across_resolved_addresses(monkeypatch):
+    import time
+
+    attempts = []
+
+    def fake_getaddrinfo(host, port, *a, **k):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.1", port)),
+        ]
+
+    def fake_attempt(family, addr, timeout):
+        attempts.append((addr[0], timeout))
+        time.sleep(timeout)  # every address hangs until its timeout
+        raise socket.timeout("timed out")
+
+    monkeypatch.setattr(health_mod.socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(health_mod, "_connect_addr", fake_attempt)
+    import pytest
+    start = time.monotonic()
+    with pytest.raises(OSError):
+        health_mod.tcp_connect("example.com", 443, 0.6)
+    # IPv4 first, and a hanging IPv4 address must not starve the IPv6 one
+    assert [a for a, _ in attempts] == ["192.0.2.1", "2001:db8::1"]
+    assert time.monotonic() - start < 1.0
+
+
+def test_slow_dns_resolution_is_bounded_and_classified_as_dns_failure(monkeypatch):
+    import time
+
+    def hanging_getaddrinfo(*a, **k):
+        time.sleep(5)
+        return []
+
+    monkeypatch.setattr(health_mod.socket, "getaddrinfo", hanging_getaddrinfo)
+    import pytest
+    start = time.monotonic()
+    with pytest.raises(socket.gaierror):
+        health_mod.tcp_connect("example.com", 443, 0.5)
+    assert time.monotonic() - start < 2
+
+
+def _serve_http(response: bytes):
+    def handler(conn):
+        conn.recv(4096)
+        conn.sendall(response)
+    return _serve_once(handler)
+
+
+def _http_target(port, status=204, body=None):
+    return Target("127.0.0.1", port, path="/generate_204", expect_status=status, expect_body=body)
+
+
+def test_http_probe_accepts_expected_status():
+    port = _serve_http(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+    health_mod.probe_target(_http_target(port), 3.0)  # no exception
+
+
+def test_http_probe_accepts_expected_body():
+    port = _serve_http(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\nSuccess")
+    health_mod.probe_target(_http_target(port, 200, "Success"), 3.0)
+
+
+def test_http_probe_flags_captive_portal_redirect():
+    import pytest
+    port = _serve_http(b"HTTP/1.1 302 Found\r\nLocation: http://portal.example/login\r\n\r\n")
+    with pytest.raises(health_mod.UnexpectedResponse) as info:
+        health_mod.probe_target(_http_target(port), 3.0)
+    assert "302" in str(info.value) and "portal.example" in str(info.value)
+
+
+def test_http_probe_flags_wrong_body():
+    import pytest
+    port = _serve_http(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n<html>login")
+    with pytest.raises(health_mod.UnexpectedResponse):
+        health_mod.probe_target(_http_target(port, 200, "Success"), 3.0)
+
+
+def test_http_probe_sends_host_header_and_path():
+    received = []
+
+    def handler(conn):
+        received.append(conn.recv(4096))
+        conn.sendall(b"HTTP/1.1 204 No Content\r\n\r\n")
+
+    port = _serve_once(handler)
+    health_mod.probe_target(_http_target(port), 3.0)
+    assert received[0].startswith(b"GET /generate_204 HTTP/1.1\r\n")
+    assert b"Host: 127.0.0.1" in received[0]
+
+
+def test_plain_tcp_target_uses_tcp_connect():
+    port = _serve_once(lambda conn: None)
+    health_mod.probe_target(Target("127.0.0.1", port), 3.0)
+
+
+def test_unexpected_response_is_marked_and_hinted_in_summary():
+    def connector(target, timeout):
+        raise health_mod.UnexpectedResponse("HTTP 302 (Location: http://portal/)")
+
+    result = check_health([Target("x.example", 80, path="/", expect_status=204)], connector=connector)
+    assert result.results[0].unexpected_response is True
+    assert result.healthy is False
+    assert "captive portal" in result.summary().lower()
+
+
+def test_tcp_only_success_does_not_count_when_verified_probes_fail():
+    """Raw-IP TCP connects can be faked by portals/middleboxes; when HTTP
+    content probes are configured, at least one must succeed."""
+    targets = [Target("1.1.1.1", 443), Target("x.example", 80, path="/", expect_status=204)]
+    connector = make_connector({("x.example", 80): health_mod.UnexpectedResponse("HTTP 302")})
+    assert check_health(targets, connector=connector).healthy is False
+
+
+def test_default_targets_include_os_connectivity_check_endpoints():
+    http = [t for t in DEFAULT_TARGETS if t.path]
+    hosts = {t.host for t in http}
+    assert {"connectivitycheck.gstatic.com", "captive.apple.com", "www.msftconnecttest.com"} <= hosts
+    assert all(t.port == 80 and (t.expect_status or t.expect_body) for t in http)
+
+
+def test_default_connector_is_probe_target():
+    import inspect
+    assert inspect.signature(check_health).parameters["connector"].default is health_mod.probe_target
+
+
+def test_target_str_for_http_target():
+    assert str(Target("h", 80, path="/p", expect_status=204)) == "http://h:80/p"
