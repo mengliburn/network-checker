@@ -47,7 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="minimum seconds between diagnostics during one outage (default 900)")
     p.add_argument("--log-dir", default="logs", help="directory for logs (default ./logs)")
     p.add_argument("--target", action="append", type=parse_target, metavar="HOST[:PORT]",
-                   help="TLS endpoint to check (repeatable; default: 1.1.1.1, 8.8.8.8, www.google.com)")
+                   help="extra TCP endpoint to probe (repeatable); added to the built-in "
+                        "content-verified connectivity checks")
+    p.add_argument("--no-default-targets", action="store_true",
+                   help="probe only --target endpoints (TCP connect only: captive portals "
+                        "can then look healthy)")
     p.add_argument("--agent-cmd", default=os.environ.get(AGENT_ENV),
                    help="agent command run on failure; {log}, {json}, {prompt} are substituted "
                         f"(default: ${AGENT_ENV}; omit to only collect diagnostics)")
@@ -58,9 +62,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
-    targets = args.target or list(DEFAULT_TARGETS)
-    agent_argv = parse_agent_command(args.agent_cmd)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.no_default_targets:
+        if not args.target:
+            parser.error("--no-default-targets requires at least one --target")
+        targets = list(args.target)
+    else:
+        targets = list(DEFAULT_TARGETS) + list(args.target or [])
+    try:
+        agent_argv = parse_agent_command(args.agent_cmd)
+    except ValueError as exc:
+        parser.error(f"invalid agent command ({AGENT_ENV} / --agent-cmd): {exc}")
 
     agent = None
     if agent_argv:

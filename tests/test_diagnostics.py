@@ -181,3 +181,28 @@ def test_redact_handles_schemeless_and_odd_passwords(value):
     out = diag_mod._redact(value)
     assert "s3cret" not in out
     assert "proxy.example" in out
+
+
+def test_run_command_timeout_kills_whole_process_tree(tmp_path):
+    import time
+    heartbeat = tmp_path / "beat.txt"
+    grandchild = (
+        "import time, sys\n"
+        "p = sys.argv[1]\n"
+        "while True:\n"
+        "    open(p, 'a').write('x'); time.sleep(0.05)\n"
+    )
+    child = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {grandchild!r}, {str(heartbeat)!r}])\n"
+        "time.sleep(60)\n"
+    )
+    start = time.monotonic()
+    out = run_command([sys.executable, "-c", child], timeout=1.5)
+    assert time.monotonic() - start < 15
+    assert "timed out" in out.error
+    time.sleep(0.5)
+    size = heartbeat.stat().st_size if heartbeat.exists() else 0
+    time.sleep(1.0)
+    after = heartbeat.stat().st_size if heartbeat.exists() else 0
+    assert after == size, "grandchild process survived the timeout"

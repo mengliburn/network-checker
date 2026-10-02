@@ -77,3 +77,34 @@ def test_module_is_runnable_with_python_dash_m():
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0
     assert "--once" in out.stdout
+
+
+def test_malformed_agent_command_is_a_usage_error_not_a_crash(monkeypatch, tmp_path, capsys):
+    _patch(monkeypatch, True, tmp_path)
+    with pytest.raises(SystemExit) as info:
+        cli.main(["--once", "--log-dir", str(tmp_path), "--agent-cmd", "agent 'x"])
+    assert info.value.code == 2
+    assert "agent" in capsys.readouterr().err.lower()
+
+
+def test_custom_targets_are_added_to_verified_defaults(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(cli, "check_health", lambda targets, timeout: seen.setdefault("t", list(targets)) and
+                        HealthResult([TargetResult(Target("x", 1), True, 1.0)]))
+    cli.main(["--once", "--log-dir", str(tmp_path), "--target", "intranet.example:443"])
+    assert Target("intranet.example", 443) in seen["t"]
+    assert any(t.path for t in seen["t"])  # content-verified probes still present
+
+
+def test_no_default_targets_flag_replaces_defaults(monkeypatch, tmp_path):
+    seen = {}
+    monkeypatch.setattr(cli, "check_health", lambda targets, timeout: seen.setdefault("t", list(targets)) and
+                        HealthResult([TargetResult(Target("x", 1), True, 1.0)]))
+    cli.main(["--once", "--log-dir", str(tmp_path), "--no-default-targets", "--target", "a.example:1"])
+    assert seen["t"] == [Target("a.example", 1)]
+
+
+def test_no_default_targets_requires_a_target(tmp_path):
+    with pytest.raises(SystemExit) as info:
+        cli.main(["--once", "--log-dir", str(tmp_path), "--no-default-targets"])
+    assert info.value.code == 2

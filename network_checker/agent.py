@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence
 
 from .diagnostics import CommandOutput, Runner, run_command
 
@@ -30,29 +31,102 @@ def build_prompt(log_path: Path) -> str:
     log_path = Path(log_path)
     return (
         "An automated internet/network health check on this machine just failed. "
-        f"Diagnostics were captured in {log_path} (human readable) and "
-        f"{log_path.with_suffix('.json')} (structured). Earlier check history is in "
+        f"Diagnostics were captured in {log_path}, human readable, and "
+        f"{log_path.with_suffix('.json')}, structured. Earlier check history is in "
         f"{log_path.parent / 'health.log'}. Read them, diagnose the most likely root "
-        "cause (e.g. local link/Wi-Fi, DHCP, gateway/router, DNS, ISP, proxy, "
-        "captive portal, firewall/VPN) and suggest concrete next steps. "
+        "cause - for example local link or Wi-Fi, DHCP, gateway or router, DNS, ISP, "
+        "proxy, captive portal, firewall or VPN - and suggest concrete next steps. "
         "Do not change system settings."
     )
 
 
 def parse_agent_command(value: Optional[str], windows: Optional[bool] = None) -> Optional[List[str]]:
-    """Split a command string into argv using the platform's quoting rules."""
+    """Split a command string into argv using the platform's quoting rules.
+
+    Raises ValueError for malformed (e.g. unbalanced-quote) POSIX commands.
+    """
     if not value or not value.strip():
         return None
     if windows is None:
         windows = os.name == "nt"
-    if not windows:
-        return shlex.split(value)
-    # Windows: keep backslashes literal; only double quotes group words.
-    argv = []
-    for token in shlex.split(value, posix=False):
-        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
-            token = token[1:-1]
-        argv.append(token)
+    return _split_windows(value) if windows else shlex.split(value)
+
+
+def _split_windows(cmdline: str) -> List[str]:
+    """Split like CommandLineToArgvW / the MSVC runtime."""
+    args: List[str] = []
+    current: List[str] = []
+    in_arg = in_quotes = False
+    i, n = 0, len(cmdline)
+    while i < n:
+        c = cmdline[i]
+        if c == "\\":
+            j = i
+            while j < n and cmdline[j] == "\\":
+                j += 1
+            count = j - i
+            if j < n and cmdline[j] == '"':
+                current.append("\\" * (count // 2))
+                if count % 2:
+                    current.append('"')
+                    i = j + 1
+                else:
+                    i = j
+            else:
+                current.append("\\" * count)
+                i = j
+            in_arg = True
+            continue
+        if c == '"':
+            if in_quotes and i + 1 < n and cmdline[i + 1] == '"':
+                current.append('"')
+                i += 2
+            else:
+                in_quotes = not in_quotes
+                i += 1
+            in_arg = True
+            continue
+        if c in " \t" and not in_quotes:
+            if in_arg:
+                args.append("".join(current))
+                current, in_arg = [], False
+            i += 1
+            continue
+        current.append(c)
+        in_arg = True
+        i += 1
+    if in_arg:
+        args.append("".join(current))
+    return args
+
+
+# cmd.exe re-parses arguments passed to .bat/.cmd files ("BatBadBut"), and
+# Python cannot escape them safely, so such arguments are refused instead.
+_BATCH_UNSAFE = set('%^&|<>"!()\r\n')
+
+
+def prepare_argv(
+    argv: Sequence[str],
+    windows: Optional[bool] = None,
+    which: Callable[[str], Optional[str]] = shutil.which,
+) -> List[str]:
+    """Resolve the executable (Windows: honour PATHEXT so npm .cmd shims work)
+    and refuse arguments that cmd.exe could misinterpret for batch files."""
+    argv = list(argv)
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows or not argv:
+        return argv
+    resolved = which(argv[0])
+    if resolved:
+        argv[0] = resolved
+    if argv[0].lower().endswith((".bat", ".cmd")):
+        for arg in argv[1:]:
+            bad = sorted(set(arg) & _BATCH_UNSAFE)
+            if bad:
+                raise ValueError(
+                    f"refusing to pass argument containing {bad!r} to batch file {argv[0]}; "
+                    "use an .exe agent or move logs to a path without these characters")
     return argv
 
 
@@ -80,6 +154,7 @@ def invoke_agent(
         argv.append(item)
 
     try:
+        argv = prepare_argv(argv)
         out = runner(argv, timeout)
     except Exception as exc:
         out = CommandOutput(None, "", "", f"{type(exc).__name__}: {exc}")

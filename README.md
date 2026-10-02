@@ -40,7 +40,10 @@ Repeated diagnostics during one long outage are rate-limited by `--cooldown`.
 python -m network_checker                 # monitor every 60s (Ctrl+C to stop)
 python -m network_checker --once          # single check; exit code 0 = healthy, 1 = unhealthy
 python -m network_checker --interval 30 --log-dir /var/log/netcheck
-python -m network_checker --target example.com:443 --target [2606:4700:4700::1111]:443
+# add extra TCP probes (the built-in content-verified checks stay on)
+python -m network_checker --target intranet.example:443 --target [2606:4700:4700::1111]:443
+# probe only your own endpoints (TCP connect only: a captive portal may look healthy)
+python -m network_checker --no-default-targets --target 10.0.0.1:53
 ```
 
 ### Configuring the agent
@@ -60,8 +63,17 @@ $env:NETWORK_CHECKER_AGENT_CMD = '"C:\Tools\my agent.exe" --log {log}'
 python -m network_checker
 ```
 
-The command runs without a shell. It is abandoned after `--agent-timeout`
-seconds (default 600).
+The command runs without a shell. If it is still running after
+`--agent-timeout` seconds (default 600), it is killed along with all its child
+processes. A malformed command, such as one with unbalanced quotes, is rejected
+at startup with exit code 2.
+
+On Windows the program name is looked up with `PATHEXT`, so `.cmd` shims
+installed by npm (e.g. `copilot.cmd`) work. `cmd.exe` re-parses arguments
+passed to `.bat`/`.cmd` files, so for those agents any argument containing
+`% ^ & | < > " ! ( )` or a newline is refused. The refusal is logged as a
+failed agent attempt. Prefer `.exe` agents, or a `--log-dir` path without
+those characters.
 
 ## Development
 

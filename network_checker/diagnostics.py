@@ -9,6 +9,7 @@ import json
 import locale
 import os
 import platform
+import signal
 import socket
 import subprocess
 import threading
@@ -87,23 +88,66 @@ def commands_for_platform(system: str) -> List[Command]:
     ]
 
 
-def run_command(argv: Sequence[str], timeout: float) -> CommandOutput:
-    """Run argv (no shell) and capture output; never raises."""
+def _kill_tree(proc: "subprocess.Popen") -> None:
+    """Kill proc and all its descendants (agents often spawn helpers)."""
     try:
-        proc = subprocess.run(
-            list(argv),
-            capture_output=True,
-            timeout=timeout,
-            stdin=subprocess.DEVNULL,
-        )
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           capture_output=True, timeout=10, stdin=subprocess.DEVNULL)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def run_command(argv: Sequence[str], timeout: float) -> CommandOutput:
+    """Run argv (no shell) and capture output; never raises (except Ctrl+C).
+
+    The child gets its own process group so that on timeout the whole tree is
+    killed; otherwise a lingering grandchild holding the output pipes could
+    block us forever (notably on Windows).
+    """
+    kwargs: dict = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(list(argv), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, **kwargs)
     except FileNotFoundError:
         return CommandOutput(None, "", "", f"command not found: {argv[0]}")
-    except subprocess.TimeoutExpired as exc:
-        return CommandOutput(None, _decode(exc.stdout), _decode(exc.stderr),
-                             f"timed out after {timeout:g}s")
     except Exception as exc:
         return CommandOutput(None, "", "", f"{type(exc).__name__}: {exc}")
-    return CommandOutput(proc.returncode, _decode(proc.stdout), _decode(proc.stderr), None)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        stdout, stderr = _drain(proc)
+        return CommandOutput(None, _decode(stdout), _decode(stderr),
+                             f"timed out after {timeout:g}s")
+    except BaseException:
+        _kill_tree(proc)
+        _drain(proc)
+        raise
+    return CommandOutput(proc.returncode, _decode(stdout), _decode(stderr), None)
+
+
+def _drain(proc: "subprocess.Popen") -> tuple:
+    try:
+        return proc.communicate(timeout=5)
+    except Exception:
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except OSError:
+                pass
+        return b"", b""
 
 
 def _fallback_encoding(windows: Optional[bool] = None) -> str:
